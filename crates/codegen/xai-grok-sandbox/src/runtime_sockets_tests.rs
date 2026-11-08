@@ -259,6 +259,39 @@ fn materialized_socket_paths_reject_endpoint_symlinks() {
 
 #[test]
 #[cfg(unix)]
+fn materialized_socket_paths_skip_unsearchable_parent() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Root ignores mode bits, so a 000 directory stays searchable.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+
+    let root = temp_runtime_root("eacces-parent");
+    let hidden = root.join("podman");
+    std::fs::create_dir(&hidden).unwrap();
+    let hidden_sock = hidden.join("podman.sock");
+    let _hidden_listener = std::os::unix::net::UnixListener::bind(&hidden_sock).unwrap();
+    let visible = root.join("docker.sock");
+    let _visible_listener = std::os::unix::net::UnixListener::bind(&visible).unwrap();
+    // Lookup of the child is EACCES even though the directory inode itself can
+    // be canonicalized. A missing name under the same parent is EACCES too,
+    // not ENOENT. A nested parent cannot be canonicalized at all.
+    let missing = hidden.join("missing.sock");
+    let nested = hidden.join("sub/podman.sock");
+    std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let paths =
+        materialize_runtime_socket_deny_paths_from([hidden_sock, missing, nested, visible.clone()])
+            .unwrap();
+
+    std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(paths, vec![visible]);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+#[cfg(unix)]
 fn materialized_socket_paths_propagate_parent_resolution_errors() {
     let root = temp_runtime_root("parent-error");
     let loop_parent = root.join("loop");

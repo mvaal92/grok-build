@@ -97,7 +97,10 @@ fn runtime_socket_deny_paths_for_context_with_policy(
     }
 }
 
-/// Missing candidates are skipped; every other resolution failure is returned.
+/// Missing candidates are skipped. A candidate whose parent this uid cannot
+/// search (`EACCES`) is skipped too: the endpoint is already unreachable, and
+/// bwrap cannot bind over a path it cannot open. Every other resolution
+/// failure is returned.
 pub(crate) fn materialize_runtime_socket_deny_paths_from(
     candidates: impl IntoIterator<Item = PathBuf>,
 ) -> io::Result<Vec<PathBuf>> {
@@ -128,19 +131,28 @@ pub(crate) fn materialize_runtime_socket_deny_paths_from(
             Ok(parent) => parent,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 match std::fs::symlink_metadata(&candidate) {
-                    Err(metadata_error) if metadata_error.kind() == io::ErrorKind::NotFound => {
+                    Err(metadata_error)
+                        if metadata_error.kind() == io::ErrorKind::NotFound
+                            || is_access_denied(&metadata_error) =>
+                    {
                         continue;
                     }
                     Ok(_) => return Err(with_context(error)),
                     Err(metadata_error) => return Err(with_context(metadata_error)),
                 }
             }
+            // An ancestor is not searchable. The socket cannot be opened.
+            Err(error) if is_access_denied(&error) => continue,
             Err(error) => return Err(with_context(error)),
         };
         let path = canonical_parent.join(file_name);
         let metadata = match std::fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            // Parent was stat-able, but lookup of the final component was
+            // denied (directory mode 0700 owned by another user). Same
+            // outcome as a missing socket: this uid cannot open it.
+            Err(error) if is_access_denied(&error) => continue,
             Err(error) => return Err(with_context(error)),
         };
         if metadata.file_type().is_symlink() {
@@ -212,6 +224,13 @@ fn runtime_socket_policy_contains(policy: &[PathBuf], handed: &Path) -> io::Resu
         }
     }
     Ok(false)
+}
+
+/// This uid cannot traverse or stat the path. `stat` on Linux needs search
+/// permission on every ancestor, not permission on the final socket, so
+/// `PermissionDenied` here means the endpoint is already outside the sandbox.
+fn is_access_denied(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::PermissionDenied
 }
 
 /// Normalize parent aliases without inspecting or following endpoint objects.
